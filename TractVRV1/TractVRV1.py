@@ -1,0 +1,774 @@
+import logging
+import os
+from typing import Annotated, Optional
+
+import vtk
+
+import slicer
+from slicer.i18n import tr as _
+from slicer.i18n import translate
+from slicer.ScriptedLoadableModule import *
+from slicer.util import VTKObservationMixin
+from slicer.parameterNodeWrapper import parameterNodeWrapper
+import time
+import csv
+from datetime import datetime
+from qt import QWidget, QObject, QEvent, QApplication, Qt
+import math
+
+
+#
+# TractVR
+#
+
+def _norm(v):
+    return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+
+def _angle_deg(a, b):
+    na, nb = _norm(a), _norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    dot = (a[0]*b[0] + a[1]*b[1] + a[2]*b[2]) / (na*nb)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+
+class TractVR(ScriptedLoadableModule):
+    """
+    Module for interacting with Markups Fiducials and ROI in VR within 3D Slicer.
+    """
+
+    def __init__(self, parent):
+        ScriptedLoadableModule.__init__(self, parent)
+        self.parent.title = _("TractVR")  # TODO: make this more human readable by adding spaces
+        # TODO: set categories (folders where the module shows up in the module selector)
+        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
+        self.parent.dependencies = []  # TODO: add here list of module names that this module requires
+        self.parent.contributors = ["John Doe (AnyWare Corp.)"]  # TODO: replace with "Firstname Lastname (Organization)"
+        # TODO: update with short description of the module and a link to online module documentation
+        # _() function marks text as translatable to other languages
+        self.parent.helpText = _("""
+This is an example of scripted loadable module bundled in an extension.
+See more information in <a href="https://github.com/organization/projectname#TractVR">module documentation</a>.
+""")
+        # TODO: replace with organization, grant and thanks
+        self.parent.acknowledgementText = _("""
+This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab,
+and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
+""")
+
+        # # Additional initialization step after application startup is complete
+        # slicer.app.connect("startupCompleted()", registerSampleData)
+
+
+#
+# TractVRParameterNode
+#
+
+
+@parameterNodeWrapper
+class TractVRParameterNode: 
+    inputVolume : slicer.vtkMRMLScalarVolumeNode 
+    fiberBundle : slicer.vtkMRMLFiberBundleNode
+   
+
+#
+# TractVRWidget
+#
+
+
+class TractVRWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+    """Uses ScriptedLoadableModuleWidget base class, available at:
+    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    """
+
+    def __init__(self, parent=None) -> None:
+        """Called when the user opens the module the first time and the widget is initialized."""
+        ScriptedLoadableModuleWidget.__init__(self, parent)
+        VTKObservationMixin.__init__(self)  # needed for parameter node observation
+        self.logic = None
+        self._parameterNode = None
+        self._parameterNodeGuiTag = None
+
+    def setup(self) -> None:
+        """Called when the user opens the module the first time and the widget is initialized."""
+        ScriptedLoadableModuleWidget.setup(self)
+
+        # Load widget from .ui file (created by Qt Designer).
+        # Additional widgets can be instantiated manually and added to self.layout.
+        uiWidget = slicer.util.loadUI(self.resourcePath("UI/TractVR.ui"))
+        self.layout.addWidget(uiWidget)
+        self.ui = slicer.util.childWidgetVariables(uiWidget)
+
+        # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
+        # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
+        # "setMRMLScene(vtkMRMLScene*)" slot.
+        uiWidget.setMRMLScene(slicer.mrmlScene)
+
+        # Create logic class. Logic implements all computations that should be possible to run
+        # in batch mode, without a graphical user interface.
+        self.logic = TractVRLogic()
+        self.logic.ui = self.ui
+
+        # Connections
+
+        # These connections ensure that we update parameter node when scene is closed
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
+
+        # Buttons
+        self.ui.startVR.clicked.connect(self.logic.onStartVR)
+        self.ui.cubeButton.clicked.connect(self.logic.onCubeCreate)
+        self.ui.sizeCube.valueChanged.connect(self.logic.onCubeSizeChanged)
+        self.ui.saveFiber.clicked.connect(self.logic.onSaveFiber)
+        self.ui.saveFiber.enabled = False
+        self.ui.endTask.clicked.connect(self.logic.onEndTask)
+
+        # Make sure parameter node is initialized (needed for module reload)
+        self.initializeParameterNode()
+
+    def cleanup(self) -> None:
+        """Called when the application closes and the module widget is destroyed."""
+        self.removeObservers()
+
+    def enter(self) -> None:
+        """Called each time the user opens this module."""
+        # Make sure parameter node exists and observed
+        self.initializeParameterNode()
+
+    def exit(self) -> None:
+        """Called each time the user opens a different module."""
+        # Do not react to parameter node changes (GUI will be updated when the user enters into the module)
+        if self._parameterNode:
+            self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
+            self._parameterNodeGuiTag = None
+            # self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
+
+    def onSceneStartClose(self, caller, event) -> None:
+        """Called just before the scene is closed."""
+        # Parameter node will be reset, do not use it anymore
+        self.setParameterNode(None)
+
+    def onSceneEndClose(self, caller, event) -> None:
+        """Called just after the scene is closed."""
+        # If this module is shown while the scene is closed then recreate a new parameter node immediately
+        if self.parent.isEntered:
+            self.initializeParameterNode()
+
+    def initializeParameterNode(self) -> None:
+        """Ensure parameter node exists and observed."""
+        # Parameter node stores all user choices in parameter values, node selections, etc.
+        # so that when the scene is saved and reloaded, these settings are restored.
+
+        self.setParameterNode(self.logic.getParameterNode())
+
+        # Select default input nodes if nothing is selected yet to save a few clicks for the user
+        # if not self._parameterNode.inputVolume:
+        #     firstVolumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
+        #     if firstVolumeNode:
+        #         self._parameterNode.inputVolume = firstVolumeNode
+
+    def setParameterNode(self, inputParameterNode: Optional[TractVRParameterNode]) -> None:
+        """
+        Set and observe parameter node.
+        Observation is needed because when the parameter node is changed then the GUI must be updated immediately.
+        """
+
+        if self._parameterNode:
+            self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
+            # self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
+        self._parameterNode = inputParameterNode
+        if self._parameterNode:
+            # Note: in the .ui file, a Qt dynamic property called "SlicerParameterName" is set on each
+            # ui element that needs connection.
+            self._parameterNodeGuiTag = self._parameterNode.connectGui(self.ui)
+    #         self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
+    #         self._checkCanApply()
+
+    # def _checkCanApply(self, caller=None, event=None) -> None:
+    #     if self._parameterNode and self._parameterNode.inputVolume and self._parameterNode.thresholdedVolume:
+    #         self.ui.applyButton.toolTip = _("Compute output volume")
+    #         self.ui.applyButton.enabled = True
+    #     else:
+    #         self.ui.applyButton.toolTip = _("Select input and output volume nodes")
+    #         self.ui.applyButton.enabled = False
+
+    # def onApplyButton(self) -> None:
+    #     """Run processing when user clicks "Apply" button."""
+    #     with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
+    #         # Compute output
+    #         self.logic.process(self.ui.inputSelector.currentNode(), self.ui.outputSelector.currentNode(),
+    #                            self.ui.imageThresholdSliderWidget.value, self.ui.invertOutputCheckBox.checked)
+
+    #         # Compute inverted output (if needed)
+    #         if self.ui.invertedOutputSelector.currentNode():
+    #             # If additional output volume is selected then result with inverted threshold is written there
+    #             self.logic.process(self.ui.inputSelector.currentNode(), self.ui.invertedOutputSelector.currentNode(),
+    #                                self.ui.imageThresholdSliderWidget.value, not self.ui.invertOutputCheckBox.checked, showResult=False)
+
+
+#
+# TractVRLogic
+#
+
+
+class TractVRLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
+    """This class should implement all the actual
+    computation done by your module.  The interface
+    should be such that other python code can import
+    this class and make use of the functionality without
+    requiring an instance of the Widget.
+    Uses ScriptedLoadableModuleLogic base class, available at:
+    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    """
+
+    def __init__(self) -> None:
+        """Called when the logic class is instantiated. Can be used for initializing member variables."""
+        ScriptedLoadableModuleLogic.__init__(self)
+        VTKObservationMixin.__init__(self)
+        self.vrLogic = None
+        self.ui = None
+        self.startTime = None
+        self.endTime = None
+        self.updateClickCount = 0
+        self.cubeMoveCount = 0
+        self.timeRunning = False
+
+        # >>> NEW: variables de tracking d’interactions et caméra
+        self.vrInteractor = None
+        self._buttonObserversIds = []
+        self._hmdObserverId = None
+        self._headTransformNode = None
+
+        self.buttonPressCount = 0
+        self.buttonReleaseCount = 0
+        self.interactionCount = 0  # press→release
+        self._pressedState = {}    # {(device,input): bool}
+
+        self.hmdDistance_mm = 0.0
+        self.hmdRotation_deg = 0.0
+        self._lastHMDPos = None     # [x,y,z] en mm (RAS)
+        self._lastHMDQuat = None    # (w,x,y,z) 
+
+        self._camEpsMm = 0.1      # seuil mm pour ignorer le micro-bruit
+        self._camEpsDeg = 0.1     # seuil deg
+
+        self.vrCamTransMm = 0.0   # distance cumulée du point de vue VR
+        self.vrCamRotDeg  = 0.0   # rotation cumulée (changement d'axe de visée)
+        self._vrCamLastPos = None
+        self._vrCamLastDir = None
+    
+
+    def getParameterNode(self):
+        return TractVRParameterNode(super().getParameterNode())
+
+    # >>> NEW: utilitaires quaternion
+    def _mat_to_quat(self, m: vtk.vtkMatrix4x4):
+        # Convertit une 3x3 rotation en quaternion (w,x,y,z)
+        r00, r01, r02 = m.GetElement(0,0), m.GetElement(0,1), m.GetElement(0,2)
+        r10, r11, r12 = m.GetElement(1,0), m.GetElement(1,1), m.GetElement(1,2)
+        r20, r21, r22 = m.GetElement(2,0), m.GetElement(2,1), m.GetElement(2,2)
+        tr = r00 + r11 + r22
+        if tr > 0:
+            S = math.sqrt(tr + 1.0) * 2
+            w = 0.25 * S
+            x = (r21 - r12) / S
+            y = (r02 - r20) / S
+            z = (r10 - r01) / S
+        elif (r00 > r11) and (r00 > r22):
+            S = math.sqrt(1.0 + r00 - r11 - r22) * 2
+            w = (r21 - r12) / S
+            x = 0.25 * S
+            y = (r01 + r10) / S
+            z = (r02 + r20) / S
+        elif r11 > r22:
+            S = math.sqrt(1.0 + r11 - r00 - r22) * 2
+            w = (r02 - r20) / S
+            x = (r01 + r10) / S
+            y = 0.25 * S
+            z = (r12 + r21) / S
+        else:
+            S = math.sqrt(1.0 + r22 - r00 - r11) * 2
+            w = (r10 - r01) / S
+            x = (r02 + r20) / S
+            y = (r12 + r21) / S
+            z = 0.25 * S
+        return (w, x, y, z)
+
+    def _quat_angle_deg(self, q1, q2):
+        # angle entre deux orientations (quaternions normalisés)
+        w1,x1,y1,z1 = q1
+        w2,x2,y2,z2 = q2
+        dot = w1*w2 + x1*x2 + y1*y2 + z1*z2
+        dot = max(-1.0, min(1.0, dot))
+        # distance angulaire (radians), tenir compte du signe (q et -q sont identiques)
+        angle = 2.0 * math.acos(abs(dot))
+        return math.degrees(angle)
+
+
+    # >>> NEW: callback bouton 3D (press/release)
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onVRButtonEvent(self, caller, event, calldata):
+        ed = vtk.vtkEventData.SafeDownCast(calldata)
+        if not ed or not isinstance(ed, vtk.vtkEventDataDevice3D):
+            return
+        device = int(ed.GetDevice())  # HMD/LeftController/RightController
+        input_ = int(ed.GetInput())   # Trigger/Grip/TrackPad/Button…
+        action = int(ed.GetAction())  # Press=1, Release=2, Touch=3, Untouch=4 (valeurs VTK)
+        key = (device, input_)
+
+        # Comptage press/release
+        if action == vtk.vtkEventDataAction.Press:
+            self.buttonPressCount += 1
+            self._pressedState[key] = True
+        elif action == vtk.vtkEventDataAction.Release:
+            self.buttonReleaseCount += 1
+            # interaction = appui→relâche sur la même (device,input)
+            if self._pressedState.get(key):
+                self.interactionCount += 1
+            self._pressedState[key] = False
+
+    # >>> NEW: callback mouvement HMD (intègre translation & rotation)
+    def _onHMDTransformModified(self, caller, event):
+         # On lit la pose depuis le node qui a changé (caller) sinon depuis le HMD connu
+        node = caller if isinstance(caller, slicer.vtkMRMLTransformNode) else self._headTransformNode
+        if not node:
+            return
+
+        m = vtk.vtkMatrix4x4()
+        node.GetMatrixTransformToParent(m)
+
+        # Position du point de vue VR = position du HMD
+        pos = (m.GetElement(0,3), m.GetElement(1,3), m.GetElement(2,3))
+        # Direction de visée "caméra" = -Z du repère HMD (forward)
+        fwd = (-m.GetElement(0,2), -m.GetElement(1,2), -m.GetElement(2,2))
+
+        # --- Translation cumulée (comme ton desktop) ---
+        if self._vrCamLastPos is not None:
+            dp = (pos[0]-self._vrCamLastPos[0], pos[1]-self._vrCamLastPos[1], pos[2]-self._vrCamLastPos[2])
+            dmm = _norm(dp)
+            if dmm > self._camEpsMm:
+                self.vrCamTransMm += dmm
+                self._vrCamLastPos = pos
+        else:
+            self._vrCamLastPos = pos
+
+        # --- Rotation cumulée (changement d'axe de visée) ---
+        if self._vrCamLastDir is not None:
+            ddeg = _angle_deg(self._vrCamLastDir, fwd)
+            if ddeg > self._camEpsDeg:
+                self.vrCamRotDeg += ddeg
+                self._vrCamLastDir = fwd
+        else:
+            self._vrCamLastDir = fwd
+
+        # Alimente tes champs existants (affichage/CSV)
+        self.hmdDistance_mm = self.vrCamTransMm
+        self.hmdRotation_deg = self.vrCamRotDeg
+
+    def onTractDisplay(self):
+        if not hasattr(self, 'tractoDisplayWidget'):
+            self.tractoDisplayWidget = slicer.modules.tractographydisplay.createNewWidgetRepresentation()
+            self.tractoDisplayWidget.setWindowFlags(self.tractoDisplayWidget.windowFlags | Qt.Tool)
+
+            class ClickOutsideFilter(QObject):
+                def __init__(self, parentWidget):
+                    super().__init__()
+                    self.parentWidget = parentWidget
+
+                def eventFilter(self, obj, event):
+                    if event.type() == QEvent.MouseButtonPress:
+                        if self.parentWidget.isVisible() and not self.parentWidget.geometry.contains(event.globalPos()):
+                            self.parentWidget.close()
+                    return False
+
+            self._clickFilter = ClickOutsideFilter(self.tractoDisplayWidget)
+            QApplication.instance().installEventFilter(self._clickFilter)
+
+            self.tractoDisplayWidget.destroyed.connect(
+                lambda: QApplication.instance().removeEventFilter(self._clickFilter)
+            )
+
+
+        self.tractoDisplayWidget.show()
+        self.tractoDisplayWidget.raise_()
+
+
+    #@vtk.calldata_type(vtk.VTK_OBJECT)
+    def onStartVR(self, roiNode):
+        self.defaultVRCamera = None
+       
+        if hasattr(slicer.modules, "virtualreality"):
+            vr = slicer.modules.virtualreality
+            vr.logic().SetVirtualRealityConnected(True)
+            vr.logic().SetVirtualRealityActive(True)
+            vr.widgetRepresentation().setControllerTransformsUpdate(True)
+            vr.widgetRepresentation().setHMDTransformUpdate(True)
+            vr.viewWidget().setGrabObjectsEnabled(True)
+            # vr.viewWidget().SetGestureButtonToGrip()
+            print("VR works")
+
+            self.disableSelection()
+            self.startTime = time.perf_counter()
+            self.updateClickCount = 0
+            self.cubeMoveCount = 0
+            self.timeRunning = True
+
+            # Reset métriques à chaque session
+            self.buttonPressCount = 0
+            self.buttonReleaseCount = 0
+            self.interactionCount = 0
+            self._pressedState.clear()
+            self.hmdDistance_mm = 0.0
+            self.hmdRotation_deg = 0.0
+
+            self.vrCamTransMm = 0.0
+            self.vrCamRotDeg  = 0.0
+            self._vrCamLastPos = None
+            self._vrCamLastDir = None
+            
+            
+
+
+            # >>> NEW: brancher les événements 3D (appui/relâche)
+            try:
+                self.vrInteractor = vr.viewWidget().interactor()
+                if self.vrInteractor:
+                    # Button3DEvent porte les Press/Release; Move3DEvent pas nécessaire pour le comptage
+                    self._buttonObserversIds.append(
+                        self.vrInteractor.AddObserver(vtk.vtkCommand.Select3DEvent, self._onVRButtonEvent)
+                    )
+            except Exception as e:
+                print(f"[VR] Interactor observer setup failed: {e}")
+
+            # >>> NEW: brancher le HMD transform pour suivre position/orientation
+            try:
+                self._headTransformNode = slicer.util.getNode("VirtualReality.HMD")
+                # init last state
+                m0 = vtk.vtkMatrix4x4()
+                self._headTransformNode.GetMatrixTransformToParent(m0)
+                self._lastHMDPos = [m0.GetElement(0,3), m0.GetElement(1,3), m0.GetElement(2,3)]
+                self._lastHMDQuat = self._mat_to_quat(m0)
+
+                # >>> SEED caméra VR (position + direction de visée depuis le HMD)
+                self._vrCamLastPos = [m0.GetElement(0,3), m0.GetElement(1,3), m0.GetElement(2,3)]
+                # vecteur "forward" de la caméra = -Z de la rotation du HMD
+                self._vrCamLastDir = (-m0.GetElement(0,2), -m0.GetElement(1,2), -m0.GetElement(2,2))
+
+                # observer: écouter les changements de transform du HMD
+                self._hmdObserverId = self._headTransformNode.AddObserver(
+                    slicer.vtkMRMLTransformNode.TransformModifiedEvent, self._onHMDTransformModified
+                )
+            except slicer.util.MRMLNodeNotFoundException:
+                print("[VR] 'VirtualReality.HMD' introuvable; métriques caméra indisponibles.")
+
+        
+
+    def disableSelection(self):
+        nodeClasses = ("vtkMRMLScalarVolumeNode", "vtkMRMLFiberBundleNode", "vtkMRMLSegmentationNode")
+        for className in nodeClasses:
+            nodes = slicer.util.getNodes(className + "*")
+            for node in nodes.values():
+                node.SetSelectable(0)
+
+    def onCubeCreate(self):
+        self.currentCubeSize = 10
+        # Create cube
+        self.cubeSource = vtk.vtkCubeSource()
+        self.cubeSource.SetXLength(10)
+        self.cubeSource.SetYLength(10)
+        self.cubeSource.SetZLength(10)
+        self.cubeSource.Update()
+
+        # Add model to scene
+        self.modelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "VR_Cube")
+        self.modelNode.SetAndObservePolyData(self.cubeSource.GetOutput())
+        modelDisplayNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelDisplayNode")
+        modelDisplayNode.SetColor(1, 0, 0)  # rouge
+        modelDisplayNode.SetOpacity(0.3)
+        modelDisplayNode.SetVisibility3D(True)
+        self.modelNode.SetAndObserveDisplayNodeID(modelDisplayNode.GetID())
+        print("cube create")
+
+        # create transform
+        self.t  = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "center")
+        mat = vtk.vtkMatrix4x4()
+        mat.Identity()
+        mat.SetElement(0, 3, 30)  # X
+        mat.SetElement(1, 3, 40)  # Y
+        mat.SetElement(2, 3, 50)  # Z
+        self.t .SetMatrixTransformToParent(mat)
+        self.modelNode.SetAndObserveTransformNodeID(self.t .GetID())
+
+        # Get the fiber bundle node
+        self.fbn = slicer.mrmlScene.GetNodesByClass("vtkMRMLFiberBundleNode").GetItemAsObject(0)
+        self.efr = self.fbn.GetExtractFromROI()
+
+        # Create implicit box
+        self.boxFunc = vtk.vtkBox()
+        self._updateBoxBounds()
+
+        self.implicitBool = vtk.vtkImplicitBoolean()
+        self.implicitBool.SetOperationTypeToIntersection()
+        self.implicitBool.AddFunction(self.boxFunc)
+
+        # Assign to ExtractFromROI
+        self.efr.SetImplicitFunction(self.implicitBool)
+
+        # négative selection
+        self.efr.SetExtractInside(False)
+        self.efr.SetExtractBoundaryCells(False)
+
+        self.efr.Modified()
+        self.fbn.SetSelectWithMarkups(True)
+        self.efr.Update()
+
+        self.t.AddObserver(
+            slicer.vtkMRMLTransformNode.TransformModifiedEvent,
+            self.onTransformModified
+        )
+
+        # self.fbn.AddObserver(
+        #     vtk.vtkCommand.ModifiedEvent,
+        #     lambda caller, evt: slicer.util.infoDisplay(
+        #         f"{caller.GetFilteredPolyData().GetNumberOfLines()} remaining fibers"
+        #     )
+        # )
+
+        self.ui.cubeButton.enabled = False
+        self.ui.saveFiber.enabled = True
+    
+    def onTransformModified(self,caller, event):
+        self.cubeMoveCount += 1
+        mat = vtk.vtkMatrix4x4()
+        caller.GetMatrixTransformToParent(mat)
+        center = [mat.GetElement(0, 3), mat.GetElement(1, 3), mat.GetElement(2, 3)]
+
+        halfSize = self.currentCubeSize / 2.0
+
+        self.boxFunc.SetBounds(
+            center[0] - halfSize, center[0] + halfSize,
+            center[1] - halfSize, center[1] + halfSize,
+            center[2] - halfSize, center[2] + halfSize,
+        )
+        self.efr.Modified()
+
+
+    def _updateBoxBounds(self):
+        mat = vtk.vtkMatrix4x4()
+        self.t.GetMatrixTransformToParent(mat)
+        halfSize = self.currentCubeSize / 2.0
+
+        center = [mat.GetElement(0, 3), mat.GetElement(1, 3), mat.GetElement(2, 3)]
+
+        self.boxFunc.SetBounds(
+            center[0] - halfSize, center[0] + halfSize,
+            center[1] - halfSize, center[1] + halfSize,
+            center[2] - halfSize, center[2] + halfSize,
+        )
+
+    def onCubeSizeChanged(self, value):
+        self.currentCubeSize = value
+        self.cubeSource.SetXLength(value)
+        self.cubeSource.SetYLength(value)
+        self.cubeSource.SetZLength(value)
+        self.cubeSource.Update()
+
+        # update the model node
+        self.modelNode.SetAndObservePolyData(self.cubeSource.GetOutput())
+        self._updateBoxBounds()
+        self.efr.Modified()
+
+
+    def onSaveFiber(self):
+        self.updateClickCount += 1  
+        self.efr.Update()
+        outputPD = self.efr.GetOutput()
+
+        polyCopy = vtk.vtkPolyData()
+        polyCopy.DeepCopy(outputPD)
+        passThrough = vtk.vtkPassThrough()
+        passThrough.SetInputData(polyCopy)
+        passThrough.Update()
+
+        self.fbn.SetMeshConnection(passThrough.GetOutputPort())
+        self.efr = self.fbn.GetExtractFromROI()
+        self.efr.SetImplicitFunction(self.implicitBool)
+        self.efr.SetExtractInside(False)
+        self.efr.SetExtractBoundaryCells(False)
+        self.efr.Modified()
+
+       # >>> NEW: nettoyage des observeurs VR
+    def _teardownVRSensors(self):
+        if self.vrInteractor and self._buttonObserversIds:
+            for oid in self._buttonObserversIds:
+                try:
+                    self.vrInteractor.RemoveObserver(oid)
+                except Exception:
+                    pass
+            self._buttonObserversIds.clear()
+        if self._headTransformNode and self._hmdObserverId:
+            try:
+                self._headTransformNode.RemoveObserver(self._hmdObserverId)
+            except Exception:
+                pass
+            self._hmdObserverId = None
+        self._headTransformNode = None
+        self.vrInteractor = None    
+           
+    def onEndTask(self):
+        
+            
+        if self.timeRunning:
+            self.endTime = time.perf_counter()
+            self.timeRunning = False
+            duration = self.endTime - self.startTime
+            if self.fbn:
+                numFibers = self.fbn.GetFilteredPolyData().GetNumberOfLines()
+                print(f"Nombre de fibres restantes : {numFibers}")
+            else:
+                print("Aucune fibre chargée.")
+                numFibers = -1
+
+            print(f"Durée totale : {duration:.2f} secondes")
+            print(f"Nombre de clics sur 'Update' : {self.updateClickCount}")
+            print(f"Nombre de déplacements du cube : {self.cubeMoveCount}")
+
+            # >>> NEW: print métriques VR
+            print(f"[VR] Press: {self.buttonPressCount} | Release: {self.buttonReleaseCount} | Interactions: {self.interactionCount}")
+            print(f"[VR] HMD distance: {self.hmdDistance_mm:.1f} mm | rotation: {self.hmdRotation_deg:.1f}°")
+
+            self.saveResultsToFile(duration, self.updateClickCount, self.cubeMoveCount, numFibers,self.buttonPressCount,
+                self.buttonReleaseCount,
+                self.interactionCount,
+                self.hmdDistance_mm,
+                self.hmdRotation_deg)
+        else:
+            print("Le chronomètre n'était pas actif.")
+
+        self._teardownVRSensors()
+
+    def getLogFilePath(self):
+        modulePath = os.path.dirname(__file__)
+        logFolderPath = os.path.join(modulePath, "..", "Resources", "Logs")
+        os.makedirs(logFolderPath, exist_ok=True)
+        logFilePath = os.path.join(logFolderPath, "tractvr_log.csv")
+        return logFilePath
+
+    # def saveResultsToFile(self, duration, updateClicks, moveCount, numFibers):
+    #     logFile = self.getLogFilePath()
+    #     fileExists = os.path.isfile(logFile)
+    #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    #     with open(logFile, mode="a", newline="") as f:
+    #         writer = csv.writer(f)
+    #         if not fileExists:
+    #             writer.writerow(["Horodatage", "Durée (s)", "Nb Update", "Nb Déplacements Cube", "Fibres restantes"])
+    #         writer.writerow([timestamp, f"{duration:.2f}", updateClicks, moveCount, numFibers])
+    #         print(f"[DEBUG] Chemin de fichier : {logFile}")
+
+    def saveResultsToFile(self, duration, updateClicks, moveCount, numFibers,
+                          vrPress, vrRelease, vrInteractions, hmdDistMM, hmdRotDeg):
+        logFile = self.getLogFilePath()
+        fileExists = os.path.isfile(logFile)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(logFile, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            if not fileExists:
+                writer.writerow([
+                    "Horodatage",
+                    "Durée (s)",
+                    "Nb Update",
+                    "Nb Déplacements Cube",
+                    "Fibres restantes",
+                    "VR Press",
+                    "VR Release",
+                    "VR Interactions",
+                    "HMD distance (mm)",
+                    "HMD rotation (deg)"
+                ])
+            writer.writerow([
+                timestamp,
+                f"{duration:.2f}",
+                updateClicks,
+                moveCount,
+                numFibers,
+                vrPress,
+                vrRelease,
+                vrInteractions,
+                f"{hmdDistMM:.1f}",
+                f"{hmdRotDeg:.1f}"
+            ])
+            print(f"[DEBUG] Chemin de fichier : {logFile}")
+
+
+
+
+#
+# TractVRTest
+#
+
+
+class TractVRTest(ScriptedLoadableModuleTest):
+    """
+    This is the test case for your scripted module.
+    Uses ScriptedLoadableModuleTest base class, available at:
+    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    """
+
+    def setUp(self):
+        """Do whatever is needed to reset the state - typically a scene clear will be enough."""
+        slicer.mrmlScene.Clear()
+
+    def runTest(self):
+        """Run as few or as many tests as needed here."""
+        self.setUp()
+        self.test_TractVR1()
+
+    def test_TractVR1(self):
+        """Ideally you should have several levels of tests.  At the lowest level
+        tests should exercise the functionality of the logic with different inputs
+        (both valid and invalid).  At higher levels your tests should emulate the
+        way the user would interact with your code and confirm that it still works
+        the way you intended.
+        One of the most important features of the tests is that it should alert other
+        developers when their changes will have an impact on the behavior of your
+        module.  For example, if a developer removes a feature that you depend on,
+        your test should break so they know that the feature is needed.
+        """
+
+        self.delayDisplay("Starting the test")
+
+        # Get/create input data
+
+        import SampleData
+
+        # registerSampleData()
+        # inputVolume = SampleData.downloadSample("TractVR1")
+        self.delayDisplay("Loaded test data set")
+
+        # inputScalarRange = inputVolume.GetImageData().GetScalarRange()
+        # self.assertEqual(inputScalarRange[0], 0)
+        # self.assertEqual(inputScalarRange[1], 695)
+
+        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
+        threshold = 100
+
+        # Test the module logic
+
+        logic = TractVRLogic()
+
+        # Test algorithm with non-inverted threshold
+        # logic.process(inputVolume, outputVolume, threshold, True)
+        # outputScalarRange = outputVolume.GetImageData().GetScalarRange()
+        # self.assertEqual(outputScalarRange[0], inputScalarRange[0])
+        # self.assertEqual(outputScalarRange[1], threshold)
+
+        # # Test algorithm with inverted threshold
+        # logic.process(inputVolume, outputVolume, threshold, False)
+        # outputScalarRange = outputVolume.GetImageData().GetScalarRange()
+        # self.assertEqual(outputScalarRange[0], inputScalarRange[0])
+        # self.assertEqual(outputScalarRange[1], inputScalarRange[1])
+
+        self.delayDisplay("Test passed")

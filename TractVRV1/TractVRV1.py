@@ -33,14 +33,14 @@ def _angle_deg(a, b):
     return math.degrees(math.acos(dot))
 
 
-class TractVR(ScriptedLoadableModule):
+class TractVRV1(ScriptedLoadableModule):
     """
     Module for interacting with Markups Fiducials and ROI in VR within 3D Slicer.
     """
 
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = _("TractVR")  # TODO: make this more human readable by adding spaces
+        self.parent.title = _("TractVRV1")  # TODO: make this more human readable by adding spaces
         # TODO: set categories (folders where the module shows up in the module selector)
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
         self.parent.dependencies = []  # TODO: add here list of module names that this module requires
@@ -48,14 +48,14 @@ class TractVR(ScriptedLoadableModule):
         # TODO: update with short description of the module and a link to online module documentation
         # _() function marks text as translatable to other languages
         self.parent.helpText = _("""
-This is an example of scripted loadable module bundled in an extension.
-See more information in <a href="https://github.com/organization/projectname#TractVR">module documentation</a>.
-""")
+        This is an example of scripted loadable module bundled in an extension.
+        See more information in <a href="https://github.com/organization/projectname#TractVR">module documentation</a>.
+        """)
         # TODO: replace with organization, grant and thanks
         self.parent.acknowledgementText = _("""
-This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab,
-and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
-""")
+        This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab,
+        and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
+        """)
 
         # # Additional initialization step after application startup is complete
         # slicer.app.connect("startupCompleted()", registerSampleData)
@@ -77,7 +77,7 @@ class TractVRParameterNode:
 #
 
 
-class TractVRWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+class TractVRV1Widget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """Uses ScriptedLoadableModuleWidget base class, available at:
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
     """
@@ -96,7 +96,7 @@ class TractVRWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # Load widget from .ui file (created by Qt Designer).
         # Additional widgets can be instantiated manually and added to self.layout.
-        uiWidget = slicer.util.loadUI(self.resourcePath("UI/TractVR.ui"))
+        uiWidget = slicer.util.loadUI(self.resourcePath("UI/TractVRV1.ui"))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
 
@@ -107,7 +107,7 @@ class TractVRWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # Create logic class. Logic implements all computations that should be possible to run
         # in batch mode, without a graphical user interface.
-        self.logic = TractVRLogic()
+        self.logic = TractVRV1Logic()
         self.logic.ui = self.ui
 
         # Connections
@@ -212,7 +212,7 @@ class TractVRWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 #
 
 
-class TractVRLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
+class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     """This class should implement all the actual
     computation done by your module.  The interface
     should be such that other python code can import
@@ -652,7 +652,7 @@ class TractVRLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         modulePath = os.path.dirname(__file__)
         logFolderPath = os.path.join(modulePath, "..", "Resources", "Logs")
         os.makedirs(logFolderPath, exist_ok=True)
-        logFilePath = os.path.join(logFolderPath, "tractvr_log.csv")
+        logFilePath = os.path.join(logFolderPath, "tractvrV1_log.csv")
         return logFilePath
 
     # def saveResultsToFile(self, duration, updateClicks, moveCount, numFibers):
@@ -710,7 +710,7 @@ class TractVRLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 #
 
 
-class TractVRTest(ScriptedLoadableModuleTest):
+class TractVRV1Test(ScriptedLoadableModuleTest):
     """
     This is the test case for your scripted module.
     Uses ScriptedLoadableModuleTest base class, available at:
@@ -724,9 +724,9 @@ class TractVRTest(ScriptedLoadableModuleTest):
     def runTest(self):
         """Run as few or as many tests as needed here."""
         self.setUp()
-        self.test_TractVR1()
+        self.test_TractVRV1()
 
-    def test_TractVR1(self):
+    def test_TractVRV1(self):
         """Ideally you should have several levels of tests.  At the lowest level
         tests should exercise the functionality of the logic with different inputs
         (both valid and invalid).  At higher levels your tests should emulate the
@@ -757,7 +757,7 @@ class TractVRTest(ScriptedLoadableModuleTest):
 
         # Test the module logic
 
-        logic = TractVRLogic()
+        logic = TractVRV1Logic()
 
         # Test algorithm with non-inverted threshold
         # logic.process(inputVolume, outputVolume, threshold, True)

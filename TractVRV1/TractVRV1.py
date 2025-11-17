@@ -250,6 +250,8 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._lastHMDPos = None     # [x,y,z] en mm (RAS)
         self._lastHMDQuat = None    # (w,x,y,z) 
 
+        self._sceneHMDObserverId = None 
+
         self._camEpsMm = 0.1      # seuil mm pour ignorer le micro-bruit
         self._camEpsDeg = 0.1     # seuil deg
 
@@ -441,27 +443,54 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             except Exception as e:
                 print(f"[VR] Interactor observer setup failed: {e}")
 
-            # >>> NEW: brancher le HMD transform pour suivre position/orientation
-            try:
-                self._headTransformNode = slicer.util.getNode("VirtualReality.HMD")
-                # init last state
-                m0 = vtk.vtkMatrix4x4()
-                self._headTransformNode.GetMatrixTransformToParent(m0)
-                self._lastHMDPos = [m0.GetElement(0,3), m0.GetElement(1,3), m0.GetElement(2,3)]
-                self._lastHMDQuat = self._mat_to_quat(m0)
+            self._initHMDTracking()
 
-                # >>> SEED caméra VR (position + direction de visée depuis le HMD)
-                self._vrCamLastPos = [m0.GetElement(0,3), m0.GetElement(1,3), m0.GetElement(2,3)]
-                # vecteur "forward" de la caméra = -Z de la rotation du HMD
-                self._vrCamLastDir = (-m0.GetElement(0,2), -m0.GetElement(1,2), -m0.GetElement(2,2))
+    def _attachHMDObserver(self, node):
+        """Attache l'observer sur le node HMD et initialise les valeurs de départ."""
+        self._headTransformNode = node
 
-                # observer: écouter les changements de transform du HMD
-                self._hmdObserverId = self._headTransformNode.AddObserver(
-                    slicer.vtkMRMLTransformNode.TransformModifiedEvent, self._onHMDTransformModified
-                )
-            except slicer.util.MRMLNodeNotFoundException:
-                print("[VR] 'VirtualReality.HMD' introuvable; métriques caméra indisponibles.")
+        m0 = vtk.vtkMatrix4x4()
+        self._headTransformNode.GetMatrixTransformToParent(m0)
+        self._lastHMDPos = [m0.GetElement(0,3), m0.GetElement(1,3), m0.GetElement(2,3)]
+        self._lastHMDQuat = self._mat_to_quat(m0)
 
+        # Seed de la caméra VR
+        self._vrCamLastPos = [m0.GetElement(0,3), m0.GetElement(1,3), m0.GetElement(2,3)]
+        self._vrCamLastDir = (-m0.GetElement(0,2), -m0.GetElement(1,2), -m0.GetElement(2,2))
+
+        self._hmdObserverId = self._headTransformNode.AddObserver(
+            slicer.vtkMRMLTransformNode.TransformModifiedEvent,
+            self._onHMDTransformModified
+        )
+        print("[VR] HMD tracking initialisé.")
+
+
+    def _initHMDTracking(self):
+        """Essayez d'abord de récupérer directement le HMD, sinon écoute NodeAddedEvent."""
+        # 1) Essai direct
+        try:
+            node = slicer.util.getNode("VirtualReality.HMD")
+            self._attachHMDObserver(node)
+            return
+        except slicer.util.MRMLNodeNotFoundException:
+            print("[VR] 'VirtualReality.HMD' pas encore créé, on attend NodeAddedEvent...")
+
+        # 2) Si pas trouvé, on écoute la scène pour savoir quand il apparaît
+        if self._sceneHMDObserverId is None:
+            @vtk.calldata_type(vtk.VTK_OBJECT)
+            def _onNodeAdded(caller, event, addedNode):
+                if (isinstance(addedNode, slicer.vtkMRMLTransformNode)
+                        and addedNode.GetName() == "VirtualReality.HMD"):
+                    print("[VR] 'VirtualReality.HMD' détecté, on connecte l'observer.")
+                    # On n'a plus besoin d'écouter la scène
+                    slicer.mrmlScene.RemoveObserver(self._sceneHMDObserverId)
+                    self._sceneHMDObserverId = None
+                    self._attachHMDObserver(addedNode)
+
+            self._sceneHMDObserverId = slicer.mrmlScene.AddObserver(
+                slicer.vtkMRMLScene.NodeAddedEvent,
+                _onNodeAdded
+            )
         
 
     def disableSelection(self):
@@ -615,6 +644,13 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self._hmdObserverId = None
         self._headTransformNode = None
         self.vrInteractor = None    
+
+        if self._sceneHMDObserverId is not None:
+            try:
+                slicer.mrmlScene.RemoveObserver(self._sceneHMDObserverId)
+            except Exception:
+                pass
+            self._sceneHMDObserverId = None
            
     def onEndTask(self):
         

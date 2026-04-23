@@ -44,7 +44,7 @@ class TractVRV1(ScriptedLoadableModule):
         # TODO: set categories (folders where the module shows up in the module selector)
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
         self.parent.dependencies = []  # TODO: add here list of module names that this module requires
-        self.parent.contributors = ["John Doe (AnyWare Corp.)"]  # TODO: replace with "Firstname Lastname (Organization)"
+        self.parent.contributors = ["Tina Nantenaina (Neuro-iX lab), Sylvain Bouix (Neuro-iX lab), Jarrett Rushmore (Boston University)"] 
         # TODO: update with short description of the module and a link to online module documentation
         # _() function marks text as translatable to other languages
         self.parent.helpText = _("""
@@ -53,12 +53,11 @@ class TractVRV1(ScriptedLoadableModule):
         """)
         # TODO: replace with organization, grant and thanks
         self.parent.acknowledgementText = _("""
-        This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab,
-        and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
+        This file was adapted from a template originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab, and Steve Pieper, Isomics, Inc.
+        This adapted work was developed as part of a project funded by the Canada Research Chair in Neuroinformatics for Multimodal Data.
+        Designated responsible investigator: Sylvain Bouix
+        Reference number: CRC-2022-00183
         """)
-
-        # # Additional initialization step after application startup is complete
-        # slicer.app.connect("startupCompleted()", registerSampleData)
 
 
 #

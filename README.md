@@ -36,14 +36,22 @@ This module is intended for trained professionals using tractography tools in a 
 5. Restart 3D Slicer if needed.
 
 ## Usage
-1. Launch 3D Slicer.
-2. Open the TractVR module.
+1. Launch **3D Slicer**.
+2. Open the **TractVR** module.
 3. Load the required tractography data.
-4. Initialize the VR environment.
-5. Use the available VR interactions to inspect and manipulate fiber bundles.
+4. Click on **Create Cube** to create the ROI cube used for fiber editing.
+5. Connect the VR headset and make sure that **Steam** and **SteamVR** are installed and running.
+6. Start the VR environment by clicking on **Start VR**.
+7. In VR environnement, move the cube using the controller to the region where fibers need to be edited or removed 
+8. Click manually on **Update Fiber** to save the current edit or cleaning step.
+9. Repeat the cube movement and update steps as needed until the fiber bundle is cleaned.
+10. When the task is completed, click on **End** in the TractVR module.
 
 ## Notes
-This repository contains the operational version of the VR module. If you are looking for the version used specifically during the experimental study, please refer to the [TractVR_UserStudy](https://github.com/TinaNant28/TractVR_UserStudy) repository.
+- TractVR uses SlicerVR to support VR visualization and controller-based interaction.  
+For more details on how VR controllers are handled in 3D Slicer, please refer to the official [SlicerVirtualReality](https://github.com/KitwareMedical/SlicerVirtualReality) GitHub repository and developer documentation.
+- The VR interaction in this project was implemented using the **OpenVR** backend
+- This repository contains the operational version of the VR module. If you are looking for the version used specifically during the experimental study, please refer to the [TractVR_UserStudy](https://github.com/TinaNant28/TractVR_UserStudy) repository.
 
 ## Funding
 This work was developed as part of a project funded by the Canada Research Chair in Neuroinformatics for Multimodal Data.  

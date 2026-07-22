@@ -13,7 +13,7 @@ from slicer.parameterNodeWrapper import parameterNodeWrapper
 import time
 import csv
 from datetime import datetime
-from qt import QWidget, QObject, QEvent, QApplication, Qt
+from qt import QWidget, QObject, QEvent, QApplication, Qt, QTimer
 import math
 
 
@@ -31,6 +31,28 @@ def _angle_deg(a, b):
     dot = (a[0]*b[0] + a[1]*b[1] + a[2]*b[2]) / (na*nb)
     dot = max(-1.0, min(1.0, dot))
     return math.degrees(math.acos(dot))
+
+def _normalize(v):
+    n = _norm(v)
+    if n < 1e-8:
+        return (0.0, 0.0, 0.0)
+    return (v[0] / n, v[1] / n, v[2] / n)
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+# VR turntable rotation tuning (degrees/sec at full stick deflection)
+VR_STICK_DEADZONE = 0.15
+VR_YAW_SPEED_DEG_PER_SEC = 60.0
+VR_PITCH_SPEED_DEG_PER_SEC = 60.0
+VR_ROLL_SPEED_DEG_PER_SEC = 60.0
 
 
 class TractVRV1(ScriptedLoadableModule):
@@ -239,6 +261,18 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._hmdObserverId = None
         self._headTransformNode = None
 
+        # >>> NEW: right "B" button -> Update Fiber
+        self._updateFiberObserverTag = None
+
+        # >>> NEW: left stick turntable rotation + modifier (roll) button
+        self._leftStickObserverTag = None
+        self._rotationModifierObserverTag = None
+        self._leftStickX = 0.0
+        self._leftStickY = 0.0
+        self._modifierHeld = False
+        self._fiberPivotWorld = None
+        self._lastRotationTickTime = None
+
         self.buttonPressCount = 0
         self.buttonReleaseCount = 0
         self.interactionCount = 0  # press→release
@@ -400,6 +434,10 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self.defaultVRCamera = None
        
         if hasattr(slicer.modules, "virtualreality"):
+            # Clean up any observers left over from a previous Start VR call (e.g. if "End Task"
+            # was never clicked in between) so they cannot pile up and double-apply input.
+            self._teardownVRSensors()
+
             vr = slicer.modules.virtualreality
             vr.logic().SetVirtualRealityConnected(True)
             vr.logic().SetVirtualRealityActive(True)
@@ -427,18 +465,64 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self.vrCamRotDeg  = 0.0
             self._vrCamLastPos = None
             self._vrCamLastDir = None
-            
-            
 
+            # >>> NEW: reset état rotation tourne-disque (stick gauche + modificateur)
+            self._leftStickX = 0.0
+            self._leftStickY = 0.0
+            self._modifierHeld = False
+            self._fiberPivotWorld = None
+            self._lastRotationTickTime = None
 
-            # >>> NEW: brancher les événements 3D (appui/relâche)
+            # >>> NEW: brancher les événements 3D (appui/relâche), via les nouveaux évenements
+            # generiques par controle physique exposes par vtkVirtualRealityViewOpenXRInteractorStyle
+            # (un identifiant d'evenement dedie par bouton/stick/grip, independant de toute
+            # traduction vers les anciens evenements 3D génériques). Voir DeveloperGuide.md de
+            # SlicerVirtualReality ("Controller event IDs").
             try:
+                import vtkSlicerVirtualRealityModuleMRMLDisplayableManagerPython as vtkSlicerVRMRMLDM
+                ControllerEvents = vtkSlicerVRMRMLDM.vtkVirtualRealityViewOpenXRInteractorStyle
+
                 self.vrInteractor = vr.viewWidget().interactor()
                 if self.vrInteractor:
-                    # Button3DEvent porte les Press/Release; Move3DEvent pas nécessaire pour le comptage
+                    highPriority = 100.0
+
+                    # Right "A" button (right_button1_click) carries Press/Release for the
+                    # press/release/interaction counting.
                     self._buttonObserversIds.append(
-                        self.vrInteractor.AddObserver(vtk.vtkCommand.Select3DEvent, self._onVRButtonEvent)
+                        self.vrInteractor.AddObserver(ControllerEvents.RightButton1ClickEvent, self._onVRButtonEvent)
                     )
+
+                    # Right "B" button (right_button2_click) -> Update Fiber. This raw event is no
+                    # longer translated into Menu3DEvent by default, so there is no built-in menu-widget
+                    # handling left to suppress (no AbortFlagOn needed).
+                    self._updateFiberObserverTag = self.vrInteractor.AddObserver(
+                        ControllerEvents.RightButton2ClickEvent, self._onUpdateFiberButtonEvent, highPriority
+                    )
+                    self._buttonObserversIds.append(self._updateFiberObserverTag)
+
+                    # Left thumbstick (left_thumbstick) -> turntable rotation input. This only fires
+                    # while the analog value actually changes, so it is used purely to cache the latest
+                    # stick position, not to drive the rotation itself (see LeftAimPoseEvent below).
+                    self._leftStickObserverTag = self.vrInteractor.AddObserver(
+                        ControllerEvents.LeftThumbstickEvent, self._onLeftStickEvent, highPriority
+                    )
+                    self._buttonObserversIds.append(self._leftStickObserverTag)
+
+                    # Left controller aim pose (left_aim_pose) fires every frame the controller is
+                    # tracked, regardless of whether the stick value changed -- the same role
+                    # Move3DEvent/"handpose" used to play. Used purely as a per-frame "tick" to
+                    # re-apply rotation from the cached stick position.
+                    self._buttonObserversIds.append(
+                        self.vrInteractor.AddObserver(ControllerEvents.LeftAimPoseEvent, self._onLeftControllerMoveEvent)
+                    )
+
+                    # Left grip (left_grip_click) -> rotation-mode modifier. High priority + AbortFlagOn
+                    # so the default translation into PositionProp3DEvent (grab/move props) never fires
+                    # for the left controller; the right grip is unaffected and still grabs props.
+                    self._rotationModifierObserverTag = self.vrInteractor.AddObserver(
+                        ControllerEvents.LeftGripClickEvent, self._onRotationModifierEvent, highPriority
+                    )
+                    self._buttonObserversIds.append(self._rotationModifierObserverTag)
             except Exception as e:
                 print(f"[VR] Interactor observer setup failed: {e}")
 
@@ -492,6 +576,159 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             )
         
 
+    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onUpdateFiberButtonEvent(self, caller, event, calldata):
+        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
+        if not ed or ed.GetAction() != vtk.vtkEventDataAction.Press:
+            return
+        if hasattr(self, "efr"):
+            self.onSaveFiber()
+        else:
+            print("[VR] 'B' pressed but no fiber bundle/ROI exists yet (use 'Create Cube' first).")
+
+    # >>> NEW: stick gauche (left_thumbstick) -> met a jour la position memorisee du stick. Cet
+    # evenement ne se declenche que lorsque la valeur change (pas a chaque frame), donc on ne
+    # fait QUE mettre en cache ici; c'est LeftAimPoseEvent (ci-dessous), qui se declenche a chaque
+    # frame, qui rejoue la rotation a partir de cette valeur memorisee.
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onLeftStickEvent(self, caller, event, calldata):
+        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
+        if not ed:
+            return
+        pos = ed.GetTrackPadPosition()
+        x, y = pos[0], pos[1]
+        # Defensive sanity check: a real thumbstick sample is always within [-1, 1]. Reject
+        # anything else (NaN/garbage) instead of caching it, in case some other action ever
+        # ends up sharing this VTK event without actually writing a fresh position.
+        if not (-1.0 <= x <= 1.0 and -1.0 <= y <= 1.0):
+            return
+        self._leftStickX, self._leftStickY = x, y
+
+    # >>> NEW: pose du controleur gauche (left_aim_pose) -> se declenche a chaque frame tant
+    # que le controleur est suivi, peu importe si le stick a change. On l'utilise comme "tick"
+    # pour rejouer la rotation en continu a partir de la derniere position memorisee du stick.
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onLeftControllerMoveEvent(self, caller, event, calldata):
+        self._applyTurntableRotation(self._leftStickX, self._leftStickY)
+
+    # >>> NEW: grip gauche (left_grip_click) -> modificateur de mode de rotation (roulis)
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRotationModifierEvent(self, caller, event, calldata):
+        caller.GetCommand(self._rotationModifierObserverTag).AbortFlagOn()
+        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
+        if not ed:
+            return
+        if ed.GetAction() == vtk.vtkEventDataAction.Press:
+            self._modifierHeld = True
+        elif ed.GetAction() == vtk.vtkEventDataAction.Release:
+            self._modifierHeld = False
+
+    # >>> NEW: centre (monde) du fiber bundle, utilisé comme pivot de rotation. Calculé une
+    # fois puis mis en cache (le bundle n'est pas déplacé par la rotation, donc son centre
+    # monde reste stable).
+    def _getFiberPivotWorld(self):
+        if self._fiberPivotWorld is not None:
+            return self._fiberPivotWorld
+        fbn = getattr(self, "fbn", None)
+        if fbn is None:
+            return None
+        polyData = fbn.GetPolyData()
+        if polyData is None or polyData.GetNumberOfPoints() == 0:
+            return None
+        center = polyData.GetCenter()
+        self._fiberPivotWorld = (center[0], center[1], center[2])
+        return self._fiberPivotWorld
+
+    # >>> NEW: direction "devant" du HMD (monde), projetée à l'horizontale (composante
+    # verticale retirée) pour ne pas dépendre de l'inclinaison de la tête.
+    def _getHMDForwardHorizontal(self, up):
+        node = self._headTransformNode
+        if node is None:
+            return None
+        m = vtk.vtkMatrix4x4()
+        node.GetMatrixTransformToParent(m)
+        fwd = (-m.GetElement(0, 2), -m.GetElement(1, 2), -m.GetElement(2, 2))
+        d = _dot(fwd, up)
+        horiz = (fwd[0] - d * up[0], fwd[1] - d * up[1], fwd[2] - d * up[2])
+        if _norm(horiz) < 1e-6:
+            return None
+        return _normalize(horiz)
+
+    # >>> NEW: applique un increment de rotation tourne-disque pour un echantillon (x,y) du
+    # stick gauche. On fait tourner le MONDE (PhysicalToWorldMatrix) autour du centre du fiber
+    # bundle plutot que de modifier la position du bundle lui-meme, afin que le bundle et le
+    # cube ROI restent alignes l'un par rapport a l'autre pendant qu'ils semblent tourner
+    # ensemble pour l'utilisateur. L'increment est proportionnel au temps reel ecoule depuis le
+    # dernier echantillon, pas a un pas fixe, donc la vitesse reste correcte quelle que soit la
+    # fréquence des evenements.
+    def _applyTurntableRotation(self, x, y):
+        now = time.perf_counter()
+        lastTime = self._lastRotationTickTime
+        self._lastRotationTickTime = now
+        if lastTime is None:
+            # Premier echantillon depuis le debut/la reprise de la session: on amorce juste
+            # l'horloge, sans appliquer de rotation (on ne connait pas encore le dt réel).
+            return
+        dt = now - lastTime
+        if dt <= 0 or dt > 0.25:
+            # Le stick etait au repos (ou la frequence des evenements a saute) depuis un moment:
+            # on ignore cet intervalle plutot que d'integrer un dt perime/anormalement grand.
+            return
+
+        if abs(x) < VR_STICK_DEADZONE:
+            x = 0.0
+        if abs(y) < VR_STICK_DEADZONE:
+            y = 0.0
+        if x == 0.0 and y == 0.0:
+            return
+
+        if not hasattr(slicer.modules, "virtualreality"):
+            return
+        vr = slicer.modules.virtualreality
+        renderWindow = vr.viewWidget().renderWindow()
+        if renderWindow is None:
+            return
+
+        pivot = self._getFiberPivotWorld()
+        if pivot is None:
+            return
+
+        up = _normalize(renderWindow.GetPhysicalViewUp())
+        camFwdHoriz = self._getHMDForwardHorizontal(up)
+        if camFwdHoriz is None:
+            return
+        right = _normalize(_cross(camFwdHoriz, up))
+
+        # We orbit the camera/world about the pivot rather than rotating the bundle
+        # directly, so every angle here is the negative of what a direct object-rotation
+        # would use: orbiting the camera by +angle makes the world appear to turn by -angle.
+        orbit = vtk.vtkTransform()
+        orbit.PostMultiply()
+        orbit.Translate(-pivot[0], -pivot[1], -pivot[2])
+
+        if self._modifierHeld:
+            # Left -> object appears to roll clockwise as the user faces it, about the
+            # horizontal direction the user is currently looking.
+            rollAngle = x * VR_ROLL_SPEED_DEG_PER_SEC * dt
+            orbit.RotateWXYZ(rollAngle, camFwdHoriz[0], camFwdHoriz[1], camFwdHoriz[2])
+        else:
+            # Right -> turntable spins counterclockwise viewed from above (about real-world up).
+            yawAngle = -x * VR_YAW_SPEED_DEG_PER_SEC * dt
+            orbit.RotateWXYZ(yawAngle, up[0], up[1], up[2])
+            # Stick pushed away from the user -> top of the object tilts away (about the
+            # horizontal axis pointing to the user's right).
+            pitchAngle = y * VR_PITCH_SPEED_DEG_PER_SEC * dt
+            orbit.RotateWXYZ(pitchAngle, right[0], right[1], right[2])
+
+        orbit.Translate(pivot[0], pivot[1], pivot[2])
+
+        currentMatrix = vtk.vtkMatrix4x4()
+        renderWindow.GetPhysicalToWorldMatrix(currentMatrix)
+        newMatrix = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(orbit.GetMatrix(), currentMatrix, newMatrix)
+        renderWindow.SetPhysicalToWorldMatrix(newMatrix)
+
     def disableSelection(self):
         nodeClasses = ("vtkMRMLScalarVolumeNode", "vtkMRMLFiberBundleNode", "vtkMRMLSegmentationNode")
         for className in nodeClasses:
@@ -516,6 +753,7 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         modelDisplayNode.SetOpacity(0.3)
         modelDisplayNode.SetVisibility3D(True)
         self.modelNode.SetAndObserveDisplayNodeID(modelDisplayNode.GetID())
+        self.cubeDisplayNode = modelDisplayNode  # >>> NEW: pour le flash blanc sur Update Fiber
         print("cube create")
 
         # create transform
@@ -608,8 +846,20 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self.efr.Modified()
 
 
+    # >>> NEW: flash bref (blanc) du cube ROI pour confirmer visuellement l'action Update Fiber
+    def _flashCubeWhite(self, durationMs=200):
+        displayNode = getattr(self, "cubeDisplayNode", None)
+        if displayNode is None:
+            return
+        displayNode.SetColor(1, 1, 1)
+        # Restaure toujours la couleur d'origine connue (rouge) plutot que de mémoriser la
+        # couleur "actuelle", pour rester correct meme si Update Fiber est declenche plusieurs
+        # fois rapidement (flashs qui se chevauchent).
+        QTimer.singleShot(durationMs, lambda: displayNode.SetColor(1, 0, 0))
+
     def onSaveFiber(self):
-        self.updateClickCount += 1  
+        self._flashCubeWhite()
+        self.updateClickCount += 1
         self.efr.Update()
         outputPD = self.efr.GetOutput()
 
@@ -628,6 +878,15 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
        # >>> NEW: nettoyage des observeurs VR
     def _teardownVRSensors(self):
+        self._leftStickX = 0.0
+        self._leftStickY = 0.0
+        self._modifierHeld = False
+        self._fiberPivotWorld = None
+        self._lastRotationTickTime = None
+        self._updateFiberObserverTag = None
+        self._leftStickObserverTag = None
+        self._rotationModifierObserverTag = None
+
         if self.vrInteractor and self._buttonObserversIds:
             for oid in self._buttonObserversIds:
                 try:

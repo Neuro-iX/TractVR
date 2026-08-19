@@ -264,7 +264,7 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         # >>> NEW: right "B" button -> Update Fiber
         self._updateFiberObserverTag = None
         self._menuSuppressObserverTag = None
-        self._hasPerControlEvents = False  # True when per-control try block succeeded
+        self._bButtonDown = False  # state flag: True between press and release
 
         # >>> NEW: left stick turntable rotation + modifier (roll) button
         self._leftStickObserverTag = None
@@ -491,20 +491,21 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             #
             # Layer 1 (always, any SlicerVR version): Menu3DEvent observer.
             #   - Aborts the event so the built-in VR menu widget cannot open.
-            #   - Calls onSaveFiber() only when per-control events are unavailable
-            #     (_hasPerControlEvents = False) to avoid a double-trigger.
+            #   - Calls onSaveFiber() on press (sole trigger for Slicer 5.12.0).
+            #   - In Slicer 5.12.3 the SlicerVR manifest replaces the VTK one so
+            #     Menu3DEvent never fires for B; this observer is registered but idle.
             #
             # Layer 2 (optional, Slicer 5.12.3+): per-control OpenXR event observers.
-            #   - RightButton2ClickEvent -> onSaveFiber().
-            #     NOTE: per-control boolean events deliver vtkEventDataDevice (no 3D position),
-            #     not vtkEventDataDevice3D. SafeDownCast to vtkEventDataDevice is tried as a
-            #     fallback so GetAction() can still filter press vs. release.
+            #   - RightButton2ClickEvent -> onSaveFiber() via _bButtonDown state flag.
+            #     Calldata is not inspected: the VTK type varies by SlicerVR build and
+            #     SafeDownCast to vtkEventDataDevice3D returns None for boolean actions.
+            #     A press/release toggle flag filters the event instead.
             #   - LeftThumbstickEvent / LeftAimPoseEvent -> turntable rotation.
             #   - LeftGripClickEvent -> rotation modifier.
             self.vrInteractor = vr.viewWidget().interactor()
             if self.vrInteractor:
                 highPriority = 100.0
-                self._hasPerControlEvents = False
+                self._bButtonDown = False
 
                 # Layer 1: always suppress Menu3DEvent (and update fiber as fallback).
                 self._menuSuppressObserverTag = self.vrInteractor.AddObserver(
@@ -548,7 +549,6 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
                     )
                     self._buttonObserversIds.append(self._rotationModifierObserverTag)
 
-                    self._hasPerControlEvents = True
                     print("[VR] Per-control OpenXR events registered (Slicer 5.12.3+).")
                 except Exception as e:
                     print(f"[VR] Per-control events unavailable, using Menu3DEvent fallback: {e}")
@@ -603,35 +603,26 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             )
         
 
-    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber.
-    # Per-control boolean events (Slicer 5.12.3+) carry vtkEventDataDevice, not
-    # vtkEventDataDevice3D. Try the 3D cast first, then fall back to the base class
-    # so GetAction() can still filter press vs. release in both cases.
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onUpdateFiberButtonEvent(self, caller, event, calldata):
-        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
-        if ed is None:
-            try:
-                ed = vtk.vtkEventDataDevice.SafeDownCast(calldata)
-            except AttributeError:
-                pass
-        if ed is None or ed.GetAction() != vtk.vtkEventDataAction.Press:
-            return
-        if hasattr(self, "efr"):
-            self.onSaveFiber()
+    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber (Slicer 5.12.3+).
+    # Calldata type varies by SlicerVR build: vtkEventDataDevice3D.SafeDownCast returns
+    # None for pure boolean actions. Use a press/release state flag instead so no
+    # calldata inspection is needed at all.
+    def _onUpdateFiberButtonEvent(self, caller, event):
+        if not self._bButtonDown:
+            self._bButtonDown = True
+            if hasattr(self, "efr"):
+                self.onSaveFiber()
+            else:
+                print("[VR] 'B' pressed but no fiber bundle/ROI exists yet (use 'Create Cube' first).")
         else:
-            print("[VR] 'B' pressed but no fiber bundle/ROI exists yet (use 'Create Cube' first).")
+            self._bButtonDown = False  # release
 
-    # Layer 1 Menu3DEvent handler: always aborts the event so the VR menu widget cannot
-    # open. Also calls onSaveFiber() when per-control events are unavailable (Slicer
-    # 5.12.0), acting as the sole B-button trigger in that case. When per-control events
-    # ARE available (_hasPerControlEvents True, Slicer 5.12.3+), RightButton2ClickEvent
-    # drives the update and this callback only aborts.
+    # Layer 1 Menu3DEvent handler (Slicer 5.12.0): aborts the menu and calls onSaveFiber().
+    # In Slicer 5.12.3 the SlicerVR manifest replaces the VTK one so Menu3DEvent never
+    # fires for B; this observer is registered but never invoked.
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onBButtonMenuEvent(self, caller, event, calldata):
         caller.GetCommand(self._menuSuppressObserverTag).AbortFlagOn()
-        if self._hasPerControlEvents:
-            return
         ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
         if not ed or ed.GetAction() != vtk.vtkEventDataAction.Press:
             return
@@ -938,7 +929,7 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._lastRotationTickTime = None
         self._updateFiberObserverTag = None
         self._menuSuppressObserverTag = None
-        self._hasPerControlEvents = False
+        self._bButtonDown = False
         self._leftStickObserverTag = None
         self._rotationModifierObserverTag = None
 

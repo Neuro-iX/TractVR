@@ -264,7 +264,7 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         # >>> NEW: right "B" button -> Update Fiber
         self._updateFiberObserverTag = None
         self._menuSuppressObserverTag = None
-        self._hasPerControlEvents = False
+        self._hasPerControlEvents = False  # True when per-control try block succeeded
 
         # >>> NEW: left stick turntable rotation + modifier (roll) button
         self._leftStickObserverTag = None
@@ -475,61 +475,83 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self._fiberPivotWorld = None
             self._lastRotationTickTime = None
 
-            # Always register the Menu3DEvent observer first (works with any SlicerVR version).
-            # The VTK OpenXR action manifest maps B -> "showmenu" -> Menu3DEvent regardless
-            # of which SlicerVR build is installed, so this is the reliable base path.
+            # Two-layer observer design to handle both Slicer 5.12.0 and 5.12.3:
+            #
+            # Slicer 5.12.0 (SlicerVR @ old KitwareMedical build):
+            #   Only the legacy VTK-level manifest is present:
+            #     lib/.../xr_actions/: B -> "showmenu" -> Menu3DEvent
+            #   No per-control events (RightButton2ClickEvent absent) -> try block fails.
+            #   Menu3DEvent is the only signal, so Layer 1 handles everything.
+            #
+            # Slicer 5.12.3 (SlicerVR @ ae4fa18):
+            #   SlicerVR ships its own manifest that replaces the VTK-level one:
+            #     share/.../VirtualReality/xr_actions/: B -> "right_button2_click" -> RightButton2ClickEvent
+            #   Menu3DEvent no longer fires for B. Per-control events exist -> try block succeeds.
+            #   Layer 2 handles B; Layer 1 Menu3DEvent observer is registered but never called.
+            #
+            # Layer 1 (always, any SlicerVR version): Menu3DEvent observer.
+            #   - Aborts the event so the built-in VR menu widget cannot open.
+            #   - Calls onSaveFiber() only when per-control events are unavailable
+            #     (_hasPerControlEvents = False) to avoid a double-trigger.
+            #
+            # Layer 2 (optional, Slicer 5.12.3+): per-control OpenXR event observers.
+            #   - RightButton2ClickEvent -> onSaveFiber().
+            #     NOTE: per-control boolean events deliver vtkEventDataDevice (no 3D position),
+            #     not vtkEventDataDevice3D. SafeDownCast to vtkEventDataDevice is tried as a
+            #     fallback so GetAction() can still filter press vs. release.
+            #   - LeftThumbstickEvent / LeftAimPoseEvent -> turntable rotation.
+            #   - LeftGripClickEvent -> rotation modifier.
             self.vrInteractor = vr.viewWidget().interactor()
             if self.vrInteractor:
                 highPriority = 100.0
                 self._hasPerControlEvents = False
 
+                # Layer 1: always suppress Menu3DEvent (and update fiber as fallback).
                 self._menuSuppressObserverTag = self.vrInteractor.AddObserver(
                     vtk.vtkCommand.Menu3DEvent, self._onBButtonMenuEvent, highPriority
                 )
                 self._buttonObserversIds.append(self._menuSuppressObserverTag)
 
-                # Try to also bind the newer per-control OpenXR events exposed by
-                # vtkVirtualRealityViewOpenXRInteractorStyle (Sunderlandkyl's SlicerVR build).
-                # If unavailable (standard KitwareMedical release), the Menu3DEvent path above
-                # already handles B and we skip this block gracefully.
+                # Layer 2: per-control events (Slicer 5.12.3+ only).
                 try:
                     import vtkSlicerVirtualRealityModuleMRMLDisplayableManagerPython as vtkSlicerVRMRMLDM
                     ControllerEvents = vtkSlicerVRMRMLDM.vtkVirtualRealityViewOpenXRInteractorStyle
 
-                    # Right "A" button -> press/release/interaction counting
+                    # Right "A" (right_button1_click) -> press/release/interaction counting
                     self._buttonObserversIds.append(
                         self.vrInteractor.AddObserver(ControllerEvents.RightButton1ClickEvent, self._onVRButtonEvent)
                     )
 
-                    # Right "B" button -> Update Fiber (Menu3DEvent observer above suppresses
-                    # the menu; this observer calls onSaveFiber via the per-control path)
+                    # Right "B" (right_button2_click) -> Update Fiber.
+                    # _onUpdateFiberButtonEvent handles the vtkEventDataDevice calldata used by
+                    # per-control boolean events (distinct from vtkEventDataDevice3D).
                     self._updateFiberObserverTag = self.vrInteractor.AddObserver(
                         ControllerEvents.RightButton2ClickEvent, self._onUpdateFiberButtonEvent, highPriority
                     )
                     self._buttonObserversIds.append(self._updateFiberObserverTag)
 
-                    # Left thumbstick -> cache stick position (fires only on value change)
+                    # Left thumbstick (left_thumbstick) -> cache stick position
                     self._leftStickObserverTag = self.vrInteractor.AddObserver(
                         ControllerEvents.LeftThumbstickEvent, self._onLeftStickEvent, highPriority
                     )
                     self._buttonObserversIds.append(self._leftStickObserverTag)
 
-                    # Left aim pose -> per-frame tick to apply turntable rotation
+                    # Left aim pose (left_aim_pose) -> per-frame turntable rotation tick
                     self._buttonObserversIds.append(
                         self.vrInteractor.AddObserver(ControllerEvents.LeftAimPoseEvent, self._onLeftControllerMoveEvent)
                     )
 
-                    # Left grip -> rotation modifier; AbortFlagOn prevents default prop-grab
+                    # Left grip (left_grip_click) -> rotation modifier; AbortFlagOn prevents
+                    # default prop-grab on the left controller
                     self._rotationModifierObserverTag = self.vrInteractor.AddObserver(
                         ControllerEvents.LeftGripClickEvent, self._onRotationModifierEvent, highPriority
                     )
                     self._buttonObserversIds.append(self._rotationModifierObserverTag)
 
                     self._hasPerControlEvents = True
-                    print("[VR] Per-control OpenXR events registered.")
+                    print("[VR] Per-control OpenXR events registered (Slicer 5.12.3+).")
                 except Exception as e:
-                    print(f"[VR] Per-control events unavailable (standard SlicerVR build): {e}")
-                    print("[VR] B button handled via Menu3DEvent fallback.")
+                    print(f"[VR] Per-control events unavailable, using Menu3DEvent fallback: {e}")
 
             self._initHMDTracking()
 
@@ -581,24 +603,35 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             )
         
 
-    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber
+    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber.
+    # Per-control boolean events (Slicer 5.12.3+) carry vtkEventDataDevice, not
+    # vtkEventDataDevice3D. Try the 3D cast first, then fall back to the base class
+    # so GetAction() can still filter press vs. release in both cases.
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onUpdateFiberButtonEvent(self, caller, event, calldata):
         ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
-        if not ed or ed.GetAction() != vtk.vtkEventDataAction.Press:
+        if ed is None:
+            try:
+                ed = vtk.vtkEventDataDevice.SafeDownCast(calldata)
+            except AttributeError:
+                pass
+        if ed is None or ed.GetAction() != vtk.vtkEventDataAction.Press:
             return
         if hasattr(self, "efr"):
             self.onSaveFiber()
         else:
             print("[VR] 'B' pressed but no fiber bundle/ROI exists yet (use 'Create Cube' first).")
 
-    # B button via showmenu -> Menu3DEvent. Always aborts the menu. When the per-control
-    # OpenXR events are unavailable (standard SlicerVR build), also triggers Update Fiber.
+    # Layer 1 Menu3DEvent handler: always aborts the event so the VR menu widget cannot
+    # open. Also calls onSaveFiber() when per-control events are unavailable (Slicer
+    # 5.12.0), acting as the sole B-button trigger in that case. When per-control events
+    # ARE available (_hasPerControlEvents True, Slicer 5.12.3+), RightButton2ClickEvent
+    # drives the update and this callback only aborts.
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onBButtonMenuEvent(self, caller, event, calldata):
         caller.GetCommand(self._menuSuppressObserverTag).AbortFlagOn()
         if self._hasPerControlEvents:
-            return  # RightButton2ClickEvent observer handles the update
+            return
         ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
         if not ed or ed.GetAction() != vtk.vtkEventDataAction.Press:
             return

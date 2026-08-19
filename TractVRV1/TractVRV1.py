@@ -551,7 +551,18 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
                     print("[VR] Per-control OpenXR events registered (Slicer 5.12.3+).")
                 except Exception as e:
-                    print(f"[VR] Per-control events unavailable, using Menu3DEvent fallback: {e}")
+                    print(f"[VR] Per-control events unavailable, falling back to Move3DEvent (Slicer 5.12.0): {e}")
+                    # Slicer 5.12.0: the SlicerVR manifest with per-control events is absent.
+                    # Move3DEvent is the only Python-accessible per-frame VTK event. Register it on
+                    # the left controller to drive the turntable tick. GetTrackPadPosition() is read
+                    # as a best-effort thumbstick sample; VTK builds that process the thumbstick
+                    # internally as a vector2 action (not in event data) will always return (0, 0),
+                    # which the deadzone guard in _applyTurntableRotation quietly discards.
+                    self._buttonObserversIds.append(
+                        self.vrInteractor.AddObserver(
+                            vtk.vtkCommand.Move3DEvent, self._onVRMove3DFallback
+                        )
+                    )
 
             self._initHMDTracking()
 
@@ -667,6 +678,25 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self._modifierHeld = True
         elif ed.GetAction() == vtk.vtkEventDataAction.Release:
             self._modifierHeld = False
+
+    # Slicer 5.12.0 fallback: Move3DEvent fires every frame for each tracked device
+    # (HMD + both controllers). Filter for the left controller only. Use the event as
+    # the per-frame rotation tick and attempt to read the thumbstick position from
+    # GetTrackPadPosition(). In VTK builds where the thumbstick is a vector2 action
+    # processed internally (no position in event data), values remain (0, 0) and the
+    # deadzone guard in _applyTurntableRotation suppresses phantom rotation.
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onVRMove3DFallback(self, caller, event, calldata):
+        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
+        if not ed:
+            return
+        if int(ed.GetDevice()) != int(vtk.vtkEventDataDevice.LeftController):
+            return
+        pos = ed.GetTrackPadPosition()
+        x, y = pos[0], pos[1]
+        if -1.0 <= x <= 1.0 and -1.0 <= y <= 1.0:
+            self._leftStickX, self._leftStickY = x, y
+        self._applyTurntableRotation(self._leftStickX, self._leftStickY)
 
     # >>> NEW: centre (monde) du fiber bundle, utilisé comme pivot de rotation. Calculé une
     # fois puis mis en cache (le bundle n'est pas déplacé par la rotation, donc son centre

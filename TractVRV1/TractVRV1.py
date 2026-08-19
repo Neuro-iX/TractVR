@@ -263,6 +263,8 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
         # >>> NEW: right "B" button -> Update Fiber
         self._updateFiberObserverTag = None
+        self._menuSuppressObserverTag = None
+        self._bButtonDown = False  # state flag: True between press and release
 
         # >>> NEW: left stick turntable rotation + modifier (roll) button
         self._leftStickObserverTag = None
@@ -272,6 +274,7 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._modifierHeld = False
         self._fiberPivotWorld = None
         self._lastRotationTickTime = None
+        self._rotationTimer = None  # 5.12.0 fallback: QTimer continuous tick
 
         self.buttonPressCount = 0
         self.buttonReleaseCount = 0
@@ -473,58 +476,99 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self._fiberPivotWorld = None
             self._lastRotationTickTime = None
 
-            # >>> NEW: brancher les événements 3D (appui/relâche), via les nouveaux évenements
-            # generiques par controle physique exposes par vtkVirtualRealityViewOpenXRInteractorStyle
-            # (un identifiant d'evenement dedie par bouton/stick/grip, independant de toute
-            # traduction vers les anciens evenements 3D génériques). Voir DeveloperGuide.md de
-            # SlicerVirtualReality ("Controller event IDs").
-            try:
-                import vtkSlicerVirtualRealityModuleMRMLDisplayableManagerPython as vtkSlicerVRMRMLDM
-                ControllerEvents = vtkSlicerVRMRMLDM.vtkVirtualRealityViewOpenXRInteractorStyle
+            # Two-layer observer design to handle both Slicer 5.12.0 and 5.12.3:
+            #
+            # Slicer 5.12.0 (SlicerVR @ old KitwareMedical build):
+            #   Only the legacy VTK-level manifest is present:
+            #     lib/.../xr_actions/: B -> "showmenu" -> Menu3DEvent
+            #   No per-control events (RightButton2ClickEvent absent) -> try block fails.
+            #   Menu3DEvent is the only signal, so Layer 1 handles everything.
+            #
+            # Slicer 5.12.3 (SlicerVR @ ae4fa18):
+            #   SlicerVR ships its own manifest that replaces the VTK-level one:
+            #     share/.../VirtualReality/xr_actions/: B -> "right_button2_click" -> RightButton2ClickEvent
+            #   Menu3DEvent no longer fires for B. Per-control events exist -> try block succeeds.
+            #   Layer 2 handles B; Layer 1 Menu3DEvent observer is registered but never called.
+            #
+            # Layer 1 (always, any SlicerVR version): Menu3DEvent observer.
+            #   - Aborts the event so the built-in VR menu widget cannot open.
+            #   - Calls onSaveFiber() on press (sole trigger for Slicer 5.12.0).
+            #   - In Slicer 5.12.3 the SlicerVR manifest replaces the VTK one so
+            #     Menu3DEvent never fires for B; this observer is registered but idle.
+            #
+            # Layer 2 (optional, Slicer 5.12.3+): per-control OpenXR event observers.
+            #   - RightButton2ClickEvent -> onSaveFiber() via _bButtonDown state flag.
+            #     Calldata is not inspected: the VTK type varies by SlicerVR build and
+            #     SafeDownCast to vtkEventDataDevice3D returns None for boolean actions.
+            #     A press/release toggle flag filters the event instead.
+            #   - LeftThumbstickEvent / LeftAimPoseEvent -> turntable rotation.
+            #   - LeftGripClickEvent -> rotation modifier.
+            self.vrInteractor = vr.viewWidget().interactor()
+            if self.vrInteractor:
+                highPriority = 100.0
+                self._bButtonDown = False
 
-                self.vrInteractor = vr.viewWidget().interactor()
-                if self.vrInteractor:
-                    highPriority = 100.0
+                # Layer 1: always suppress Menu3DEvent (and update fiber as fallback).
+                self._menuSuppressObserverTag = self.vrInteractor.AddObserver(
+                    vtk.vtkCommand.Menu3DEvent, self._onBButtonMenuEvent, highPriority
+                )
+                self._buttonObserversIds.append(self._menuSuppressObserverTag)
 
-                    # Right "A" button (right_button1_click) carries Press/Release for the
-                    # press/release/interaction counting.
+                # Layer 2: per-control events (Slicer 5.12.3+ only).
+                try:
+                    import vtkSlicerVirtualRealityModuleMRMLDisplayableManagerPython as vtkSlicerVRMRMLDM
+                    ControllerEvents = vtkSlicerVRMRMLDM.vtkVirtualRealityViewOpenXRInteractorStyle
+
+                    # Right "A" (right_button1_click) -> press/release/interaction counting
                     self._buttonObserversIds.append(
                         self.vrInteractor.AddObserver(ControllerEvents.RightButton1ClickEvent, self._onVRButtonEvent)
                     )
 
-                    # Right "B" button (right_button2_click) -> Update Fiber. This raw event is no
-                    # longer translated into Menu3DEvent by default, so there is no built-in menu-widget
-                    # handling left to suppress (no AbortFlagOn needed).
+                    # Right "B" (right_button2_click) -> Update Fiber.
+                    # _onUpdateFiberButtonEvent handles the vtkEventDataDevice calldata used by
+                    # per-control boolean events (distinct from vtkEventDataDevice3D).
                     self._updateFiberObserverTag = self.vrInteractor.AddObserver(
                         ControllerEvents.RightButton2ClickEvent, self._onUpdateFiberButtonEvent, highPriority
                     )
                     self._buttonObserversIds.append(self._updateFiberObserverTag)
 
-                    # Left thumbstick (left_thumbstick) -> turntable rotation input. This only fires
-                    # while the analog value actually changes, so it is used purely to cache the latest
-                    # stick position, not to drive the rotation itself (see LeftAimPoseEvent below).
+                    # Left thumbstick (left_thumbstick) -> cache stick position
                     self._leftStickObserverTag = self.vrInteractor.AddObserver(
                         ControllerEvents.LeftThumbstickEvent, self._onLeftStickEvent, highPriority
                     )
                     self._buttonObserversIds.append(self._leftStickObserverTag)
 
-                    # Left controller aim pose (left_aim_pose) fires every frame the controller is
-                    # tracked, regardless of whether the stick value changed -- the same role
-                    # Move3DEvent/"handpose" used to play. Used purely as a per-frame "tick" to
-                    # re-apply rotation from the cached stick position.
+                    # Left aim pose (left_aim_pose) -> per-frame turntable rotation tick
                     self._buttonObserversIds.append(
                         self.vrInteractor.AddObserver(ControllerEvents.LeftAimPoseEvent, self._onLeftControllerMoveEvent)
                     )
 
-                    # Left grip (left_grip_click) -> rotation-mode modifier. High priority + AbortFlagOn
-                    # so the default translation into PositionProp3DEvent (grab/move props) never fires
-                    # for the left controller; the right grip is unaffected and still grabs props.
+                    # Left grip (left_grip_click) -> rotation modifier; AbortFlagOn prevents
+                    # default prop-grab on the left controller
                     self._rotationModifierObserverTag = self.vrInteractor.AddObserver(
                         ControllerEvents.LeftGripClickEvent, self._onRotationModifierEvent, highPriority
                     )
                     self._buttonObserversIds.append(self._rotationModifierObserverTag)
-            except Exception as e:
-                print(f"[VR] Interactor observer setup failed: {e}")
+
+                    print("[VR] Per-control OpenXR events registered (Slicer 5.12.3+).")
+                except Exception as e:
+                    print(f"[VR] Per-control events unavailable, falling back to Move3DEvent + QTimer (Slicer 5.12.0): {e}")
+                    # Slicer 5.12.0: per-control events absent.
+                    # Move3DEvent fires only on thumbstick VALUE CHANGE (not every frame), so it
+                    # can only update the stick cache, not drive the rotation tick itself.
+                    # A QTimer at ~90 Hz provides the continuous tick independently.
+                    self._buttonObserversIds.append(
+                        self.vrInteractor.AddObserver(
+                            vtk.vtkCommand.Move3DEvent, self._onVRMove3DFallback
+                        )
+                    )
+                    self._rotationTimer = QTimer()
+                    self._rotationTimer.setInterval(11)  # ~90 Hz
+                    self._rotationTimer.timeout.connect(
+                        lambda: self._applyTurntableRotation(self._leftStickX, self._leftStickY)
+                    )
+                    self._rotationTimer.start()
+                    print("[VR] Rotation timer started.")
 
             self._initHMDTracking()
 
@@ -576,9 +620,26 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             )
         
 
-    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber
+    # >>> NEW: bouton "B" droit (right_button2_click) -> Update Fiber (Slicer 5.12.3+).
+    # Calldata type varies by SlicerVR build: vtkEventDataDevice3D.SafeDownCast returns
+    # None for pure boolean actions. Use a press/release state flag instead so no
+    # calldata inspection is needed at all.
+    def _onUpdateFiberButtonEvent(self, caller, event):
+        if not self._bButtonDown:
+            self._bButtonDown = True
+            if hasattr(self, "efr"):
+                self.onSaveFiber()
+            else:
+                print("[VR] 'B' pressed but no fiber bundle/ROI exists yet (use 'Create Cube' first).")
+        else:
+            self._bButtonDown = False  # release
+
+    # Layer 1 Menu3DEvent handler (Slicer 5.12.0): aborts the menu and calls onSaveFiber().
+    # In Slicer 5.12.3 the SlicerVR manifest replaces the VTK one so Menu3DEvent never
+    # fires for B; this observer is registered but never invoked.
     @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onUpdateFiberButtonEvent(self, caller, event, calldata):
+    def _onBButtonMenuEvent(self, caller, event, calldata):
+        caller.GetCommand(self._menuSuppressObserverTag).AbortFlagOn()
         ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
         if not ed or ed.GetAction() != vtk.vtkEventDataAction.Press:
             return
@@ -593,14 +654,16 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # frame, qui rejoue la rotation a partir de cette valeur memorisee.
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onLeftStickEvent(self, caller, event, calldata):
-        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
-        if not ed:
+        # LeftThumbstickEvent calldata cannot be SafeDownCast to vtkEventDataDevice3D
+        # (same limitation as RightButton2ClickEvent for the B button). Call
+        # GetTrackPadPosition() directly on the Python-wrapped calldata object instead.
+        if calldata is None:
             return
-        pos = ed.GetTrackPadPosition()
+        try:
+            pos = calldata.GetTrackPadPosition()
+        except AttributeError:
+            return
         x, y = pos[0], pos[1]
-        # Defensive sanity check: a real thumbstick sample is always within [-1, 1]. Reject
-        # anything else (NaN/garbage) instead of caching it, in case some other action ever
-        # ends up sharing this VTK event without actually writing a fresh position.
         if not (-1.0 <= x <= 1.0 and -1.0 <= y <= 1.0):
             return
         self._leftStickX, self._leftStickY = x, y
@@ -608,8 +671,9 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # >>> NEW: pose du controleur gauche (left_aim_pose) -> se declenche a chaque frame tant
     # que le controleur est suivi, peu importe si le stick a change. On l'utilise comme "tick"
     # pour rejouer la rotation en continu a partir de la derniere position memorisee du stick.
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onLeftControllerMoveEvent(self, caller, event, calldata):
+    # No @vtk.calldata_type decorator: LeftAimPoseEvent calldata type varies by SlicerVR build
+    # and the decorator silently suppresses the callback when the type doesn't match VTK_OBJECT.
+    def _onLeftControllerMoveEvent(self, caller, event):
         self._applyTurntableRotation(self._leftStickX, self._leftStickY)
 
     # >>> NEW: grip gauche (left_grip_click) -> modificateur de mode de rotation (roulis)
@@ -623,6 +687,28 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self._modifierHeld = True
         elif ed.GetAction() == vtk.vtkEventDataAction.Release:
             self._modifierHeld = False
+
+    # Slicer 5.12.0 fallback: Move3DEvent fires every frame for each tracked device
+    # (HMD + both controllers). Filter for the left controller only. Use the event as
+    # the per-frame rotation tick and attempt to read the thumbstick position from
+    # GetTrackPadPosition(). In VTK builds where the thumbstick is a vector2 action
+    # processed internally (no position in event data), values remain (0, 0) and the
+    # deadzone guard in _applyTurntableRotation suppresses phantom rotation.
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onVRMove3DFallback(self, caller, event, calldata):
+        # Only updates the stick position cache — the QTimer provides the continuous tick.
+        # Move3DEvent fires on value CHANGE, not every frame, so calling
+        # _applyTurntableRotation here directly would only rotate on stick changes, not
+        # while the stick is held steady.
+        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
+        if not ed:
+            return
+        if int(ed.GetDevice()) != int(vtk.vtkEventDataDevice.LeftController):
+            return
+        pos = ed.GetTrackPadPosition()
+        x, y = pos[0], pos[1]
+        if -1.0 <= x <= 1.0 and -1.0 <= y <= 1.0:
+            self._leftStickX, self._leftStickY = x, y
 
     # >>> NEW: centre (monde) du fiber bundle, utilisé comme pivot de rotation. Calculé une
     # fois puis mis en cache (le bundle n'est pas déplacé par la rotation, donc son centre
@@ -884,8 +970,13 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._fiberPivotWorld = None
         self._lastRotationTickTime = None
         self._updateFiberObserverTag = None
+        self._menuSuppressObserverTag = None
+        self._bButtonDown = False
         self._leftStickObserverTag = None
         self._rotationModifierObserverTag = None
+        if self._rotationTimer is not None:
+            self._rotationTimer.stop()
+            self._rotationTimer = None
 
         if self.vrInteractor and self._buttonObserversIds:
             for oid in self._buttonObserversIds:

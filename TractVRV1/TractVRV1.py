@@ -274,6 +274,7 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._modifierHeld = False
         self._fiberPivotWorld = None
         self._lastRotationTickTime = None
+        self._rotationTimer = None  # 5.12.0 fallback: QTimer continuous tick
 
         self.buttonPressCount = 0
         self.buttonReleaseCount = 0
@@ -551,18 +552,23 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
                     print("[VR] Per-control OpenXR events registered (Slicer 5.12.3+).")
                 except Exception as e:
-                    print(f"[VR] Per-control events unavailable, falling back to Move3DEvent (Slicer 5.12.0): {e}")
-                    # Slicer 5.12.0: the SlicerVR manifest with per-control events is absent.
-                    # Move3DEvent is the only Python-accessible per-frame VTK event. Register it on
-                    # the left controller to drive the turntable tick. GetTrackPadPosition() is read
-                    # as a best-effort thumbstick sample; VTK builds that process the thumbstick
-                    # internally as a vector2 action (not in event data) will always return (0, 0),
-                    # which the deadzone guard in _applyTurntableRotation quietly discards.
+                    print(f"[VR] Per-control events unavailable, falling back to Move3DEvent + QTimer (Slicer 5.12.0): {e}")
+                    # Slicer 5.12.0: per-control events absent.
+                    # Move3DEvent fires only on thumbstick VALUE CHANGE (not every frame), so it
+                    # can only update the stick cache, not drive the rotation tick itself.
+                    # A QTimer at ~90 Hz provides the continuous tick independently.
                     self._buttonObserversIds.append(
                         self.vrInteractor.AddObserver(
                             vtk.vtkCommand.Move3DEvent, self._onVRMove3DFallback
                         )
                     )
+                    self._rotationTimer = QTimer()
+                    self._rotationTimer.setInterval(11)  # ~90 Hz
+                    self._rotationTimer.timeout.connect(
+                        lambda: self._applyTurntableRotation(self._leftStickX, self._leftStickY)
+                    )
+                    self._rotationTimer.start()
+                    print("[VR] Rotation timer started.")
 
             self._initHMDTracking()
 
@@ -648,14 +654,16 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # frame, qui rejoue la rotation a partir de cette valeur memorisee.
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onLeftStickEvent(self, caller, event, calldata):
-        ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
-        if not ed:
+        # LeftThumbstickEvent calldata cannot be SafeDownCast to vtkEventDataDevice3D
+        # (same limitation as RightButton2ClickEvent for the B button). Call
+        # GetTrackPadPosition() directly on the Python-wrapped calldata object instead.
+        if calldata is None:
             return
-        pos = ed.GetTrackPadPosition()
+        try:
+            pos = calldata.GetTrackPadPosition()
+        except AttributeError:
+            return
         x, y = pos[0], pos[1]
-        # Defensive sanity check: a real thumbstick sample is always within [-1, 1]. Reject
-        # anything else (NaN/garbage) instead of caching it, in case some other action ever
-        # ends up sharing this VTK event without actually writing a fresh position.
         if not (-1.0 <= x <= 1.0 and -1.0 <= y <= 1.0):
             return
         self._leftStickX, self._leftStickY = x, y
@@ -663,8 +671,9 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # >>> NEW: pose du controleur gauche (left_aim_pose) -> se declenche a chaque frame tant
     # que le controleur est suivi, peu importe si le stick a change. On l'utilise comme "tick"
     # pour rejouer la rotation en continu a partir de la derniere position memorisee du stick.
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onLeftControllerMoveEvent(self, caller, event, calldata):
+    # No @vtk.calldata_type decorator: LeftAimPoseEvent calldata type varies by SlicerVR build
+    # and the decorator silently suppresses the callback when the type doesn't match VTK_OBJECT.
+    def _onLeftControllerMoveEvent(self, caller, event):
         self._applyTurntableRotation(self._leftStickX, self._leftStickY)
 
     # >>> NEW: grip gauche (left_grip_click) -> modificateur de mode de rotation (roulis)
@@ -687,6 +696,10 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # deadzone guard in _applyTurntableRotation suppresses phantom rotation.
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onVRMove3DFallback(self, caller, event, calldata):
+        # Only updates the stick position cache — the QTimer provides the continuous tick.
+        # Move3DEvent fires on value CHANGE, not every frame, so calling
+        # _applyTurntableRotation here directly would only rotate on stick changes, not
+        # while the stick is held steady.
         ed = vtk.vtkEventDataDevice3D.SafeDownCast(calldata)
         if not ed:
             return
@@ -696,7 +709,6 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         x, y = pos[0], pos[1]
         if -1.0 <= x <= 1.0 and -1.0 <= y <= 1.0:
             self._leftStickX, self._leftStickY = x, y
-        self._applyTurntableRotation(self._leftStickX, self._leftStickY)
 
     # >>> NEW: centre (monde) du fiber bundle, utilisé comme pivot de rotation. Calculé une
     # fois puis mis en cache (le bundle n'est pas déplacé par la rotation, donc son centre
@@ -962,6 +974,9 @@ class TractVRV1Logic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._bButtonDown = False
         self._leftStickObserverTag = None
         self._rotationModifierObserverTag = None
+        if self._rotationTimer is not None:
+            self._rotationTimer.stop()
+            self._rotationTimer = None
 
         if self.vrInteractor and self._buttonObserversIds:
             for oid in self._buttonObserversIds:
